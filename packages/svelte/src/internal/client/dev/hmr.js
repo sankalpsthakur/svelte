@@ -5,7 +5,7 @@ import { hydrate_node, hydrating } from '../dom/hydration.js';
 import { block, branch, destroy_effect } from '../reactivity/effects.js';
 import { set, source } from '../reactivity/sources.js';
 import { set_should_intro } from '../render.js';
-import { active_effect, get } from '../runtime.js';
+import { active_effect, get, untrack } from '../runtime.js';
 
 /**
  * @template {(anchor: Comment, props: any) => any} Component
@@ -19,8 +19,21 @@ export function hmr(fn) {
 	 * @param {any} props
 	 */
 	function wrapper(initial_anchor, props) {
+		if (new.target) {
+			// `new Component(...)` (legacy `componentApi: 4`) must return the real instance, as
+			// `$set`/`$on`/`$destroy` live on its prototype and would not be copied onto `instance`
+			// below. The compiled component hands the options to `createClassComponent`, which
+			// mounts this wrapper as a function, so hot updates still work. Read `current` untracked
+			// so that constructing a component inside an effect does not subscribe it to HMR updates.
+			// @ts-expect-error
+			return new (untrack(() => get(current)))(initial_anchor, props);
+		}
+
 		let component = {};
 		let instance = {};
+
+		/** @type {string[]} the keys of `instance` that were copied from the component */
+		let copied = [];
 
 		/** @type {Effect} */
 		let effect;
@@ -34,8 +47,10 @@ export function hmr(fn) {
 			}
 
 			if (effect) {
+				// only remove what we copied: `createClassComponent` adds `$set` and `$destroy`
+				// to the instance, and those have to survive updates
 				// @ts-ignore
-				for (var k in instance) delete instance[k];
+				for (const key of copied) delete instance[key];
 				destroy_effect(effect);
 			}
 
@@ -45,13 +60,13 @@ export function hmr(fn) {
 				// when the component is invalidated, replace it without transitions
 				if (ran) set_should_intro(false);
 
-				// preserve getters/setters
-				var result =
-					// @ts-expect-error
-					new.target ? new component(anchor, props) : component(anchor, props);
+				// @ts-expect-error
+				var result = component(anchor, props);
 				// a component is not guaranteed to return something and we can't invoke getOwnPropertyDescriptors on undefined
 				if (result) {
+					// preserve getters/setters
 					Object.defineProperties(instance, Object.getOwnPropertyDescriptors(result));
+					copied = Object.keys(result);
 				}
 
 				if (ran) set_should_intro(true);
